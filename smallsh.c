@@ -1,9 +1,13 @@
-#define _GNU_SOURCE
 #include <sys/wait.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 #include <stdlib.h>
+#include <err.h>
+#include <errno.h>
+#include <fcntl.h>
+
+static int last_status = 0;
 
 void 
 execute(char **argv){
@@ -33,6 +37,7 @@ main(int argc, char* argv[]){
         char *input = NULL;
         size_t len = 2048;
         getline(&input, &len, stdin);
+        // remove the newline character 
         input[strlen(input)-1] = '\0';
 
         // initialize an array of pointers for all input arguments
@@ -87,21 +92,36 @@ main(int argc, char* argv[]){
             arg = strtok(NULL, " ");
         }
 
-        printf("Total args: %d\n", total_args);
+        // printf("Total args: %d\n", total_args);
         total_command_args += total_args;
         // get the command args (arguments for the command)
         char *command_args[total_command_args + 1];
         memcpy(command_args, &arguments, (total_command_args+1)*sizeof(char*));
         command_args[total_command_args] = NULL;
 
-        for(int i = 0; i < total_command_args; i++){
-            printf("%s\n", command_args[i]);
-        }
+        // for(int i = 0; i < total_command_args; i++){
+        //     printf("%s\n", command_args[i]);
+        // }
+
         // check if command is exit
+        if(strcmp(command_args[0], "exit") == 0){
+            // send signal to stop child processes
+            kill(0, SIGKILL);
+            if((last_status = wait(0)) < 0) err(errno, "Wait failed");
+            exit(EXIT_SUCCESS);
+        }
 
         // check if command is cd 
-
+        if(strcmp(command_args[0], "cd") == 0){ 
+            if(total_args == 1) chdir(getenv("HOME"));
+            else chdir(command_args[1]);
+            continue;
+        }
         // check if command is status 
+        if(strcmp(command_args[0], "status") == 0){ 
+            printf("exit value %d\n", last_status);
+            continue;
+        }
 
         // other commands 
         pid_t spawnPid = -5;
@@ -111,12 +131,30 @@ main(int argc, char* argv[]){
         switch(spawnPid){
             case -1: { perror("Hull Breach\n"); exit(1); break; }
             case 0: {
+                if(outfile_index > -1){
+                    int outfile = open(command_args[outfile_index], O_WRONLY ,"w");
+                    if(dup2(outfile, STDIN_FILENO) == -1){
+                        fprintf(stderr, "Cannot open for %s output\n", command_args[outfile_index]);
+                        break;
+                    }
+                } 
+                if(infile_index > -1){
+                    int infile = open(command_args[infile_index], O_RDONLY ,"r");
+                    if(dup2(infile, STDOUT_FILENO) == -1){
+                        fprintf(stderr, "Cannot open %s for input\n", command_args[infile_index]);
+                        break;
+                    }
+                } 
                 execute(command_args);
+                last_status = 1;
                 perror("Child: exec failed\n");
                 exit(2); break;
             }
             default: {
                 pid_t actualPid = waitpid(spawnPid, &childExitStatus, 0);
+                if(strcmp(command_args[total_command_args - 1], "&") != 0){
+                    last_status = WEXITSTATUS(childExitStatus);
+                }
                 break;
             }
         }
