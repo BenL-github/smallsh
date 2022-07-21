@@ -9,8 +9,49 @@
 
 static int last_status = 0;
 static int terminated_signal = 0;
+static pid_t fg_process = 0;
+static int fg_mode = 0;
 
-int 
+// void 
+// wait_fg(pid_t p_id){
+//     // block until child process finished 
+//     int childExitStatus;
+//     pid_t result = waitpid(p_id, &childExitStatus, 0);
+
+//     // check if 
+//     // check child process termination
+//     if(WIFSIGNALED(childExitStatus)){
+//         printf("terminated by signal %d\n", WTERMSIG(childExitStatus));
+//         fflush(stdout);
+//         last_status = WTERMSIG(childExitStatus);
+//         terminated_signal = 1;
+//     }
+//     // processed finished normally 
+//     else {
+//         last_status = WEXITSTATUS(childExitStatus);
+//         terminated_signal = 0;
+//     }
+//     fg_process = 0;
+// }
+
+void 
+handle_SIGTSTP(){
+    // wait until foreground process finishes 
+    if(fg_mode){
+        fg_mode = 0;
+        char *msg = "Exiting foreground-only mode\n";
+        write(STDOUT_FILENO, msg, 29);
+        fflush(stdout);
+    } 
+    else {
+        fg_mode = 1;
+        char *msg = "Entering foreground only mode (& is now ignored)\n";
+        write(STDOUT_FILENO, msg, 49);
+        fflush(stdout);
+    }
+}
+
+void
 run_exec(char **commands, char *infile, char *outfile, int background){
     // other commands 
     int childExitStatus;
@@ -18,80 +59,103 @@ run_exec(char **commands, char *infile, char *outfile, int background){
     switch(spawnPid){
         case -1: { perror("Hull Breach\n"); exit(1); break; }
         case 0: {
-            // child process will run
-            // perform output redirect 
+            // CHILD PROCESS
+
+            // all child processes will ignore SIGSTP
+            struct sigaction SIGSTP_action = {0};
+            SIGSTP_action.sa_handler = SIG_IGN;
+            sigfillset(&SIGSTP_action.sa_mask);
+            SIGSTP_action.sa_flags = 0;
+            sigaction(SIGSTOP, &SIGSTP_action, NULL);
+
+            // foreground processes will terminate upon receipt of SIGINT
+            if(!background){
+                struct sigaction SIGINT_action = {0};
+                SIGINT_action.sa_handler = SIG_DFL;
+                sigfillset(&SIGINT_action.sa_mask);
+                SIGINT_action.sa_flags = 0;
+                sigaction(SIGINT, &SIGINT_action, NULL);
+            } 
+
+            // OUTPUT REDIRECT 
+            // check:
+            // 1 - there is an outfile
+            // 2 - background process but no outfile 
             if(outfile || (background && !outfile)){
                 int out;
-                if (background) {
-                    out = open("/dev/null", O_WRONLY);
-                }
-                else {
-                    out = open(outfile, O_WRONLY | O_CREAT);
-                }
-
+                if (background) out = open("/dev/null", O_WRONLY);
+                else out = open(outfile, O_WRONLY | O_CREAT);
+                
+                // try opening for redirect  
                 if(dup2(out, STDOUT_FILENO) == -1){
+                    // redirect failed - EXIT COMMAND 
                     fprintf(stderr, "Cannot open for %s output\n", outfile);
+                    fflush(stderr);
                     last_status = 1;
-                    close(out);
                     break;
                 }
             } 
 
-            // perform input redirect
+            // INPUT REDIRECTION
+            // check if:
+            // 1 - there is an infile
+            // 2 - background process but no infile 
             if(infile || (background && !infile)){
                 int in;
                 if (background) in = open("/dev/null", O_RDONLY);
                 else in = open(infile, O_RDONLY);
-
+                
+                // try opening for redirect
                 if(dup2(in, STDIN_FILENO) == -1){
+                    // redirect failed - EXIT COMMAND
                     fprintf(stderr, "Cannot open %s for input\n", infile);
+                    fflush(stderr);
                     last_status = 1;
-                    close(in);
                     break;
                 }
             }
 
-            // foreground processes will terminate upon
-            // recipe of SIGINT
-            if(!background){
-                struct sigaction shell_action = {0};
-                shell_action.sa_handler = SIG_DFL;
-                sigfillset(&shell_action.sa_mask);
-                shell_action.sa_flags = 0;
-                sigaction(SIGINT, &shell_action, NULL);
-            }
-
+            // execute command 
             if(execvp(*commands, commands) < 0){
+                // command not found or failed 
                 last_status = 1;
                 fprintf(stderr, "%s: no such file or directory\n", commands[0]);
+                fflush(stderr);
             }
-
             break;
         }
         default: {
-            // parent process
+            // PARENT PROCESS 
+
+            // FOREGROUND PROCESS 
             if(!background){
-                // foreground process
-                pid_t actualPid = waitpid(spawnPid, &childExitStatus, 0);
+                pid_t result = waitpid(spawnPid, &childExitStatus, 0);
+                // check child process termination
                 if(WIFSIGNALED(childExitStatus)){
                     printf("terminated by signal %d\n", WTERMSIG(childExitStatus));
+                    fflush(stdout);
                     last_status = WTERMSIG(childExitStatus);
+                    terminated_signal = 1;
                 }
-                else last_status = WEXITSTATUS(childExitStatus);
-                
+                // processed finished normally 
+                else {
+                    last_status = WEXITSTATUS(childExitStatus);
+                    terminated_signal = 0;
+                }
                 break;
             }
-            // if background process: run in background 
+
+            // BACKGROUND PROCESS 
+            // do not block 
             waitpid(spawnPid, &childExitStatus, WNOHANG);
             printf("background pid is %d\n", spawnPid);
             fflush(stdout);
             break;
         }
     }
-
-    return 1;
 }
-int 
+
+void 
 run_cmd(char **commands, char *infile, char *outfile, int background){
     // BUILT-IN COMMANDS
     if(strcmp(commands[0], "exit") == 0){
@@ -108,14 +172,15 @@ run_cmd(char **commands, char *infile, char *outfile, int background){
     // check if command is status 
     else if(strcmp(commands[0], "status") == 0){ 
         if(terminated_signal){
-            printf("terminated by signal %d", last_status);
+            printf("terminated by signal %d\n", last_status);
         }
-        printf("exit value %d\n", last_status);
+        else printf("exit value %d\n", last_status);
+        fflush(stdout);
     }
-    else{
+    // run exec()
+    else {
         run_exec(commands, infile, outfile, background);
     }
-    return 1;
 }
 
 void 
@@ -135,16 +200,15 @@ shell(){
                     finished_bg_process, bg_status);
             }
         }
+        fflush(stdout);
 
         // print the prompt
         printf(": ");
         fflush(stdout);
 
         // create buffer for input and get user input as a line
-        char *input = NULL;
-        size_t len = 2048; // len is just a buffer => not the max length => >>>>>>>> FIX <<<<<<<<<<<
-        getline(&input, &len, stdin);
-        // remove the newline character 
+        char input[2048] = "";
+        fgets(input, 2048, stdin);
         input[strlen(input)-1] = '\0';
 
         // initialize an array of pointers for all input arguments
@@ -185,7 +249,7 @@ shell(){
                 outfile_index = index + 1; 
                 // subtract 2 args for the redirect + filename
                 total_command_args -= 1;
-            } else if(strcmp(arg, "&") == 0){ 
+            } else if((strcmp(arg, "&") == 0) && !fg_mode){ 
                 background = 1; 
             } else {
                 total_command_args++;
@@ -212,19 +276,26 @@ shell(){
         memcpy(command_args, &arguments, (total_command_args+1)*sizeof(char*));
         command_args[total_command_args] = NULL;
 
-        // built in 
+        // run the command 
         run_cmd(command_args, infile, outfile, background);
     }
 }
 
 int 
 main(int argc, char* argv[]){
-    // signal hander to have smallsh ignore SIGINT (ctrl + c)
-    struct sigaction shell_action = {0};
-    shell_action.sa_handler = SIG_IGN;
-    sigfillset(&shell_action.sa_mask);
-    shell_action.sa_flags = 0;
-    sigaction(SIGINT, &shell_action, NULL);
+    // signal hander to ignore SIGINT (ctrl + c)
+    struct sigaction SIGINT_action = {0};
+    SIGINT_action.sa_handler = SIG_IGN;
+    sigfillset(&SIGINT_action.sa_mask);
+    SIGINT_action.sa_flags = 0;
+    sigaction(SIGINT, &SIGINT_action, NULL);
+
+    // signal handler for SIGSTP
+    struct sigaction SIGTSTP_action = {0};
+    SIGTSTP_action.sa_handler = handle_SIGTSTP;
+    sigfillset(&SIGTSTP_action.sa_mask);
+    SIGTSTP_action.sa_flags = 0;
+    sigaction(SIGTSTP, &SIGTSTP_action, NULL);
 
     // run the shell
     shell();
